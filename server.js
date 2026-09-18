@@ -3,7 +3,7 @@ const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
 
 const initialData = {
   rubbings: [
@@ -55,6 +55,7 @@ const routes = [
   "POST /rubbings/:id/damages",
   "GET /damages?status=&type=",
   "PATCH /damages/:id",
+  "POST /damages/:id/merge",
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
@@ -120,8 +121,49 @@ function findRubbing(db, rubbingId) {
   return rubbing;
 }
 
+function fail(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  throw error;
+}
+
+// 旧记录缺少合并字段时按未合并处理
+function mergedIntoOf(damage) {
+  return damage.mergedInto || null;
+}
+
+function assertMergeable(db, damage, label) {
+  if (mergedIntoOf(damage)) fail(409, `${label}已合并，不能重复合并`);
+  if (damage.status === "repaired") fail(409, `${label}已修复，不能合并`);
+  const batch = damage.batchId ? db.batches.find((item) => item.id === damage.batchId) : null;
+  if (batch && batch.status !== "completed") fail(409, `${label}在未结批次中，不能合并`);
+  if (damage.status !== "pending") fail(409, `${label}当前状态不能合并`);
+}
+
+// 合并操作串行化，并发重复合并只允许一次成功
+let mergeQueue = Promise.resolve();
+function withMergeLock(task) {
+  const run = mergeQueue.then(task);
+  mergeQueue = run.catch(() => {});
+  return run;
+}
+
 function enrichBatch(db, batch) {
-  const damages = db.damages.filter((item) => batch.damageIds.includes(item.id));
+  const members = db.damages.filter((item) => batch.damageIds.includes(item.id));
+  const groups = new Map();
+  members.forEach((item) => {
+    const primaryId = mergedIntoOf(item) || item.id;
+    if (!groups.has(primaryId)) groups.set(primaryId, { primary: null, merged: [] });
+    const group = groups.get(primaryId);
+    if (mergedIntoOf(item)) group.merged.push(item);
+    else group.primary = item;
+  });
+  const damages = [];
+  groups.forEach((group, primaryId) => {
+    const primary = group.primary || db.damages.find((item) => item.id === primaryId);
+    if (!primary) return;
+    damages.push({ ...primary, mergedDamages: group.merged });
+  });
   return {
     ...batch,
     damages,
@@ -190,6 +232,8 @@ async function handle(req, res) {
       status: "pending",
       repairNote: "",
       batchId: null,
+      mergedInto: null,
+      mergedAt: null,
       createdAt: new Date().toISOString(),
       repairedAt: null
     };
@@ -223,6 +267,29 @@ async function handle(req, res) {
     return send(res, 200, { data: damage });
   }
 
+  const mergeMatch = pathname.match(/^\/damages\/([^/]+)\/merge$/);
+  if (mergeMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["targetId"]);
+    const data = await withMergeLock(async () => {
+      const fresh = await readDb();
+      const secondary = fresh.damages.find((item) => item.id === mergeMatch[1]);
+      if (!secondary) fail(404, "缺损项不存在");
+      const primary = fresh.damages.find((item) => item.id === body.targetId);
+      if (!primary) fail(404, "目标缺损项不存在");
+      if (secondary.id === primary.id) fail(400, "不能合并到自身");
+      assertMergeable(fresh, secondary, "缺损项");
+      assertMergeable(fresh, primary, "主记录");
+      if (secondary.rubbingId !== primary.rubbingId) fail(409, "两条缺损不属于同一拓片，不能合并");
+      secondary.status = "merged";
+      secondary.mergedInto = primary.id;
+      secondary.mergedAt = new Date().toISOString();
+      await writeDb(fresh);
+      return { primary, secondary };
+    });
+    return send(res, 200, { data });
+  }
+
   if (req.method === "GET" && pathname === "/batches") {
     return send(res, 200, { data: db.batches.map((batch) => enrichBatch(db, batch)) });
   }
@@ -246,7 +313,7 @@ async function handle(req, res) {
     db.damages.forEach((damage) => {
       if (body.damageIds.includes(damage.id)) {
         damage.batchId = batch.id;
-        damage.status = "in_repair";
+        if (!mergedIntoOf(damage)) damage.status = "in_repair";
       }
     });
     await writeDb(db);
@@ -269,13 +336,25 @@ async function handle(req, res) {
     batch.status = "completed";
     batch.completedAt = new Date().toISOString();
     batch.note = body.note ?? batch.note;
-    db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
-      const result = results.find((item) => item.damageId === damage.id) || {};
-      damage.status = "repaired";
-      damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
-      damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+    const primaryIds = [];
+    batch.damageIds.forEach((id) => {
+      const damage = db.damages.find((item) => item.id === id);
+      if (!damage) return;
+      const primaryId = mergedIntoOf(damage) || damage.id;
+      if (!primaryIds.includes(primaryId)) primaryIds.push(primaryId);
+    });
+    primaryIds.forEach((primaryId) => {
+      const primary = db.damages.find((item) => item.id === primaryId);
+      if (!primary) return;
+      const memberIds = [primaryId];
+      db.damages.forEach((item) => {
+        if (mergedIntoOf(item) === primaryId && batch.damageIds.includes(item.id)) memberIds.push(item.id);
+      });
+      const result = results.find((item) => memberIds.includes(item.damageId)) || {};
+      primary.status = "repaired";
+      primary.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || primary.afterPhotoUrl;
+      primary.repairNote = result.repairNote || body.defaultRepairNote || primary.repairNote;
+      primary.repairedAt = new Date().toISOString();
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
